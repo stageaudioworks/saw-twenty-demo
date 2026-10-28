@@ -26,10 +26,12 @@ fail() { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || fail "Run as root on the Proxmox host."
 command -v pct >/dev/null || fail "pct not found: run this on the Proxmox host, not inside a container."
-if [ -z "${GH_TOKEN:-}" ]; then
+# A token is only needed while the repo is private.
+if [ -z "${GH_TOKEN:-}" ] && ! curl -fsS -o /dev/null "https://api.github.com/repos/${REPO}"; then
   read -rsp "GitHub token (read-only, for ${REPO}): " GH_TOKEN </dev/tty; echo
+  [ -n "$GH_TOKEN" ] || fail "No GitHub token given."
 fi
-[ -n "$GH_TOKEN" ] || fail "No GitHub token given."
+GH_TOKEN="${GH_TOKEN:-}"
 
 # ---------- checks ----------
 say "Checking the host"
@@ -43,8 +45,10 @@ if pvesm status 2>/dev/null | awk -v s="$STORAGE" '$1==s{print $2}' | grep -q zf
     fail "OpenZFS $ZFS_VER is too old for Docker in an LXC on ZFS (needs 2.2+). Update Proxmox or use a VM."
   fi
 fi
-curl -fsS -o /dev/null -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${REPO}" \
-  || fail "GitHub token cannot read ${REPO}. Check its repository access and Contents: read permission."
+if [ -n "$GH_TOKEN" ]; then
+  curl -fsS -o /dev/null -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${REPO}" \
+    || fail "GitHub token cannot read ${REPO}. Check its repository access and Contents: read permission."
+fi
 
 CTID="${CTID:-$(pvesh get /cluster/nextid)}"
 pct status "$CTID" >/dev/null 2>&1 && fail "Container $CTID already exists. Set CTID=<free id>."
@@ -101,11 +105,16 @@ pct push "$CTID" "$TOKFILE" /root/.gh-token --perms 600
 rm -f "$TOKFILE"
 pct exec "$CTID" -- bash -c "
   set -e
-  AUTH=\$(printf 'x-access-token:%s' \"\$(cat /root/.gh-token)\" | base64 -w0)
-  rm -f /root/.gh-token
   rm -rf /opt/saw-twenty-demo
-  git -c credential.helper= -c \"http.extraHeader=Authorization: Basic \$AUTH\" \
-    clone --depth 1 https://github.com/${REPO}.git /opt/saw-twenty-demo
+  if [ -s /root/.gh-token ]; then
+    AUTH=\$(printf 'x-access-token:%s' \"\$(cat /root/.gh-token)\" | base64 -w0)
+    rm -f /root/.gh-token
+    git -c credential.helper= -c \"http.extraHeader=Authorization: Basic \$AUTH\" \
+      clone --depth 1 https://github.com/${REPO}.git /opt/saw-twenty-demo
+  else
+    rm -f /root/.gh-token
+    git clone --depth 1 https://github.com/${REPO}.git /opt/saw-twenty-demo
+  fi
 "
 
 say "Installing the demo (Twenty, mock SAP B1, sync service) — the first start takes a few minutes"
