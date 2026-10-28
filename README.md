@@ -12,6 +12,21 @@ Service Layer and a sync service that links the two. One command installs it on 
 Everything in the demo data is invented except the customer names and installed systems, which come
 from SAW's published case studies. All B1 figures (balances, prices, stock) are made up.
 
+## Quick deploy on Proxmox (one command)
+
+In the Proxmox host's shell, as root, with a GitHub fine-grained token that can read this repo:
+
+```bash
+read -rsp "GitHub token: " GH_TOKEN; echo; export GH_TOKEN
+curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://raw.githubusercontent.com/stageaudioworks/saw-twenty-demo/main/deploy/proxmox-deploy.sh -o /root/saw-crm-deploy.sh && bash /root/saw-crm-deploy.sh
+```
+
+`deploy/proxmox-deploy.sh` creates a Debian 12 LXC (next free ID, storage `zfs1`, bridge `vmbr0`, DHCP),
+installs Docker, clones this repo and runs `install.sh`. Override with `CTID=`, `STORAGE=`, `BRIDGE=`,
+`PUBLIC_URL=` before `bash`. The token is used once and not stored in the container.
+
+The manual steps below do the same by hand.
+
 ## 1. Create the container on Proxmox
 
 A Debian 12 LXC is enough for the demo. On the Proxmox host:
