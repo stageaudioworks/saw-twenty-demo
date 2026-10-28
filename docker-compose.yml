@@ -1,0 +1,165 @@
+# Twenty CRM demo for Stage Audio Works, with a mock SAP B1 Service Layer and the sync service.
+# Twenty services follow Twenty's official compose file (packages/twenty-docker/docker-compose.yml).
+name: saw-twenty
+
+x-twenty-env: &twenty-env
+  PG_DATABASE_URL: postgres://postgres:${PG_DATABASE_PASSWORD}@db:5432/default
+  SERVER_URL: ${SERVER_URL}
+  REDIS_URL: redis://redis:6379
+  STORAGE_TYPE: local
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+  APP_SECRET: ${APP_SECRET}
+  # Webhooks and workflow HTTP steps may only reach these private hosts (Twenty blocks the rest).
+  OUTBOUND_HTTP_ALLOWED_INTERNAL_HOSTS: saw-sync,${B1_HOST_ALLOWLIST:-mock-b1}
+  # Setup makes a few hundred API calls; the default is 100 per minute.
+  API_RATE_LIMITING_SHORT_LIMIT: ${API_RATE_LIMIT:-600}
+  API_RATE_LIMITING_LONG_LIMIT: ${API_RATE_LIMIT:-600}
+  # Microsoft 365 mail and calendar sync (phase 2) — needs an Azure app registration
+  AUTH_MICROSOFT_ENABLED: ${AUTH_MICROSOFT_ENABLED:-false}
+  MESSAGING_PROVIDER_MICROSOFT_ENABLED: ${AUTH_MICROSOFT_ENABLED:-false}
+  CALENDAR_PROVIDER_MICROSOFT_ENABLED: ${AUTH_MICROSOFT_ENABLED:-false}
+  AUTH_MICROSOFT_CLIENT_ID: ${AUTH_MICROSOFT_CLIENT_ID:-}
+  AUTH_MICROSOFT_CLIENT_SECRET: ${AUTH_MICROSOFT_CLIENT_SECRET:-}
+  AUTH_MICROSOFT_CALLBACK_URL: ${SERVER_URL}/auth/microsoft/redirect
+  AUTH_MICROSOFT_APIS_CALLBACK_URL: ${SERVER_URL}/auth/microsoft-apis/get-access-token
+
+x-node: &node
+  image: node:22-alpine
+  restart: unless-stopped
+  working_dir: /app
+
+services:
+  server:
+    image: twentycrm/twenty:${TWENTY_TAG:-latest}
+    volumes:
+      - server-local-data:/app/packages/twenty-server/.local-storage
+    ports:
+      - "${TWENTY_PORT:-3000}:3000"
+    environment:
+      <<: *twenty-env
+      NODE_PORT: 3000
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: curl --fail http://localhost:3000/healthz
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    restart: always
+
+  worker:
+    image: twentycrm/twenty:${TWENTY_TAG:-latest}
+    volumes:
+      - server-local-data:/app/packages/twenty-server/.local-storage
+    command: ["yarn", "worker:prod"]
+    environment:
+      <<: *twenty-env
+      DISABLE_DB_MIGRATIONS: "true"
+      DISABLE_CRON_JOBS_REGISTRATION: "true"
+    depends_on:
+      server: { condition: service_healthy }
+    restart: always
+
+  db:
+    image: postgres:16
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: default
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PG_DATABASE_PASSWORD}
+    healthcheck:
+      test: pg_isready -U postgres -h localhost -d postgres
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: always
+
+  redis:
+    image: redis:7
+    command: ["--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: always
+
+  # Mock SAP B1 Service Layer. Remove this service (and point B1_URL at the real one) for phase 3.
+  mock-b1:
+    <<: *node
+    command: ["node", "mock-b1/server.mjs"]
+    volumes:
+      - ./mock-b1:/app/mock-b1:ro
+      - b1-mock-data:/data
+    environment:
+      B1_COMPANY_DB: ${B1_COMPANY_DB}
+      B1_USER: ${B1_USER}
+      B1_PASSWORD: ${B1_PASSWORD}
+    ports:
+      - "${B1_MOCK_PORT:-50000}:50000"
+
+  # Sync service (Twenty ⇄ SAP B1)
+  saw-sync:
+    <<: *node
+    command: ["node", "sync/server.mjs"]
+    volumes:
+      - ./sync:/app/sync:ro
+      - ./setup:/app/setup:ro
+      - ./state:/state
+    environment:
+      TWENTY_INTERNAL_URL: http://server:3000
+      TWENTY_API_KEY: ${TWENTY_API_KEY:-}
+      B1_URL: ${B1_URL}
+      B1_COMPANY_DB: ${B1_COMPANY_DB}
+      B1_USER: ${B1_USER}
+      B1_PASSWORD: ${B1_PASSWORD}
+      B1_TLS_INSECURE: ${B1_TLS_INSECURE:-false}
+      B1_WRITE_ENABLED: ${B1_WRITE_ENABLED:-true}
+      B1_LUMP_SUM_ITEM: ${B1_LUMP_SUM_ITEM:-PRJ-LUMPSUM}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET}
+      SYNC_INTERVAL_SEC: ${SYNC_INTERVAL_SEC:-60}
+      ITEM_SYNC_INTERVAL_SEC: ${ITEM_SYNC_INTERVAL_SEC:-300}
+    ports:
+      - "${SYNC_STATUS_PORT:-8088}:8088"
+    depends_on:
+      server: { condition: service_healthy }
+
+  # One-shot setup: docker compose run --rm setup
+  setup:
+    image: node:22-alpine
+    working_dir: /app
+    profiles: ["setup"]
+    command: ["node", "setup/run-all.mjs"]
+    volumes:
+      - ./setup:/app/setup:ro
+      - ./state:/state
+    environment:
+      TWENTY_INTERNAL_URL: http://server:3000
+      SERVER_URL: ${SERVER_URL}
+      TWENTY_API_KEY: ${TWENTY_API_KEY:-}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      WORKSPACE_NAME: ${WORKSPACE_NAME:-Stage Audio Works}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET}
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
+    depends_on:
+      server: { condition: service_healthy }
+
+  # Optional: publish Twenty through Cloudflare Tunnel (set CLOUDFLARE_TUNNEL_TOKEN, then
+  # docker compose --profile tunnel up -d). In the tunnel's public hostname, point the
+  # service at http://server:3000 and set SERVER_URL to that hostname.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    restart: unless-stopped
+
+volumes:
+  db-data:
+  server-local-data:
+  b1-mock-data:
